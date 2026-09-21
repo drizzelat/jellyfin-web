@@ -440,15 +440,14 @@ export class HtmlVideoPlayer {
     setSrcWithHlsJs(elem, options, url) {
         return new Promise((resolve, reject) => {
             requireHlsPlayer(async () => {
-                let maxBufferLength = 30;
-
                 // Some browsers cannot handle huge fragments in high bitrate.
                 // This issue usually happens when using HWA encoders with a high bitrate setting.
                 // Limit the BufferLength to 6s, it works fine when playing 4k 120Mbps over HLS on chrome.
                 // https://github.com/video-dev/hls.js/issues/876
-                if ((browser.chrome || browser.edgeChromium || browser.firefox) && playbackManager.getMaxStreamingBitrate(this) >= 25000000) {
-                    maxBufferLength = 6;
-                }
+                const getMaxBufferLength = (bitrate) => {
+                    return (browser.chrome || browser.edgeChromium || browser.firefox) && bitrate >= 25000000 ? 6 : 30;
+                };
+                const maxBufferLength = getMaxBufferLength(playbackManager.getMaxStreamingBitrate(this));
 
                 const includeCorsCredentials = await getIncludeCorsCredentials();
 
@@ -457,11 +456,20 @@ export class HtmlVideoPlayer {
                     manifestLoadingTimeOut: 20000,
                     maxBufferLength: maxBufferLength,
                     maxMaxBufferLength: maxBufferLength,
+                    capLevelToPlayerSize: true,
                     videoPreference: { preferHDR: true },
                     xhrSetup(xhr) {
                         xhr.withCredentials = includeCorsCredentials;
                     }
                 });
+
+                // Size the buffer for the level actually loading, so a low adaptive bitrate level keeps the full buffer
+                hls.on(Hls.Events.LEVEL_SWITCHING, (_event, data) => {
+                    const levelBufferLength = getMaxBufferLength(hls.levels[data.level]?.bitrate || 0);
+                    hls.config.maxBufferLength = levelBufferLength;
+                    hls.config.maxMaxBufferLength = levelBufferLength;
+                });
+
                 hls.loadSource(url);
                 hls.attachMedia(elem);
 
