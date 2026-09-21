@@ -44,6 +44,7 @@ import { PluginType } from '../../types/plugin.ts';
 import Events from '../../utils/events.ts';
 import { includesAny } from '../../utils/container.ts';
 import { isHls } from '../../utils/mediaSource.ts';
+import { createHlsFloorLevel } from './hlsFloorLevel';
 
 /**
  * Returns resolved URL.
@@ -450,6 +451,7 @@ export class HtmlVideoPlayer {
                 const maxBufferLength = getMaxBufferLength(playbackManager.getMaxStreamingBitrate(this));
 
                 const includeCorsCredentials = await getIncludeCorsCredentials();
+                const floorLevel = createHlsFloorLevel(elem, includeCorsCredentials);
 
                 const hls = new Hls({
                     startPosition: options.playerStartPositionTicks / 10000000,
@@ -458,6 +460,8 @@ export class HtmlVideoPlayer {
                     maxMaxBufferLength: maxBufferLength,
                     capLevelToPlayerSize: true,
                     videoPreference: { preferHDR: true },
+                    fLoader: floorLevel.FragmentLoader,
+                    pLoader: floorLevel.PlaylistLoader,
                     xhrSetup(xhr) {
                         xhr.withCredentials = includeCorsCredentials;
                     }
@@ -469,6 +473,8 @@ export class HtmlVideoPlayer {
                     hls.config.maxBufferLength = levelBufferLength;
                     hls.config.maxMaxBufferLength = levelBufferLength;
                 });
+
+                floorLevel.attach(hls);
 
                 hls.loadSource(url);
                 hls.attachMedia(elem);
