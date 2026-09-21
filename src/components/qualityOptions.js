@@ -77,6 +77,10 @@ export function getVideoQualityOptions(options) {
     return qualityOptions;
 }
 
+export function getBitrateName(bitrate) {
+    return bitrate >= 1000000 ? `${Number((bitrate / 1000000).toFixed(1))} Mbps` : `${Math.round(bitrate / 1000)} kbps`;
+}
+
 export function getAudioQualityOptions(options) {
     const maxStreamingBitrate = options.currentMaxBitrate;
 
@@ -127,5 +131,6 @@ export function getAudioQualityOptions(options) {
 
 export default {
     getVideoQualityOptions,
-    getAudioQualityOptions
+    getAudioQualityOptions,
+    getBitrateName
 };
