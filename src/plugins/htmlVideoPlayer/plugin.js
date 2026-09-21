@@ -2126,6 +2126,18 @@ export class HtmlVideoPlayer {
         return this.setAirPlayEnabled(!this.isAirPlayEnabled());
     }
 
+    /**
+     * Bitrate of the adaptive bitrate level playing now, or null without adaptive bitrate streaming.
+     */
+    getPlayingAdaptiveBitrate() {
+        const hls = this._hlsPlayer;
+        if (!hls || hls.levels.length < 2) {
+            return null;
+        }
+
+        return hls.levels[hls.currentLevel]?.bitrate || null;
+    }
+
     getBufferedRanges() {
         const mediaElement = this.#mediaElement;
         if (mediaElement) {

@@ -123,7 +123,9 @@ function getQualitySecondaryText(player) {
         if (state.PlayState && state.PlayState.PlayMethod !== 'Transcode') {
             text += ' - Direct';
         } else {
-            text += ' ' + selectedOption.autoText;
+            // With adaptive bitrate streaming, the bitrate playing now rather than the ceiling
+            const playingBitrate = player.getPlayingAdaptiveBitrate?.();
+            text += ' ' + (playingBitrate ? qualityoptions.getBitrateName(playingBitrate) : selectedOption.autoText);
         }
     }
 
