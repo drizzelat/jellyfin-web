@@ -2860,6 +2860,11 @@ export class PlaybackManager {
 
                     if (mediaSource.TranscodingSubProtocol === 'hls') {
                         contentType = 'application/x-mpegURL';
+
+                        // With quality on Auto, let the server offer lower bitrate variants to switch between
+                        if (type === 'Video' && appSettings.enableAutomaticBitrateDetection(apiClient.getSavedEndpointInfo()?.IsInNetwork, type)) {
+                            mediaUrl += '&EnableAdaptiveBitrateStreaming=true';
+                        }
                     } else {
                         contentType = getMimeType(type.toLowerCase(), mediaSource.TranscodingContainer);
 
