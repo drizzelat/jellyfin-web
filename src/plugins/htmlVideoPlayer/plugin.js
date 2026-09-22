@@ -453,7 +453,7 @@ export class HtmlVideoPlayer {
                 const maxBufferLength = getMaxBufferLength(maxStreamingBitrate);
 
                 const includeCorsCredentials = await getIncludeCorsCredentials();
-                const floorLevel = createHlsFloorLevel(elem, includeCorsCredentials);
+                const floorLevel = createHlsFloorLevel(elem, includeCorsCredentials, maxStreamingBitrate);
 
                 const hls = new Hls({
                     startPosition: options.playerStartPositionTicks / 10000000,

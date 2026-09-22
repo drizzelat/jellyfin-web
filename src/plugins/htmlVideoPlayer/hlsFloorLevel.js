@@ -3,6 +3,10 @@
  * playlist loaded in advance. When the connection breaks down, playback drops to the lowest level at once instead of
  * waiting for its playlist, a new transcode and a download. The server runs that level as a transcode of its own,
  * next to the level playing.
+ *
+ * The ladder also reaches above the bitrate the client measured at playback start, for a connection that gets better
+ * later. Levels above the ones playback has already used are only opened up once the connection has held up for a
+ * while, so a link that comes and goes does not restart the server's encoder over and over.
  */
 
 // Seconds of the lowest level kept loaded past the end of the buffer
@@ -14,6 +18,12 @@ const RECOVER_BUFFER = 10;
 const CHECK_INTERVAL = 250;
 // Seconds of buffer a level picked by hand leaves in place, so its transcode has time to start
 const SWITCH_MARGIN = 10;
+// Seconds the connection has to carry a level playback has not used yet before it is opened up
+const CLIMB_STEADY = 30;
+// Seconds between two of those steps up, so a link that comes and goes does not restart the encoder each time
+const CLIMB_DWELL = 60;
+// Headroom over such a level's bitrate the connection has to show for all of CLIMB_STEADY
+const CLIMB_HEADROOM = 1.4;
 // Older browsers play on as before, without the lowest level kept loaded
 const isSupported = typeof AbortController !== 'undefined' && typeof ReadableStream !== 'undefined';
 
@@ -45,7 +55,7 @@ function parsePlaylist(text, baseUrl) {
 /**
  * Creates the loaders to pass to the hls.js config, then attach() the hls.js instance.
  */
-export function createHlsFloorLevel(media, includeCorsCredentials) {
+export function createHlsFloorLevel(media, includeCorsCredentials, maxStreamingBitrate) {
     const DefaultLoader = Hls.DefaultConfig.loader;
     const credentials = includeCorsCredentials ? 'include' : 'same-origin';
     // Downloaded fragments of the lowest level by sequence number, and its init segment as 'init'
@@ -75,10 +85,28 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
     // Set by a drop to the lowest level, until it has buffered RECOVER_BUFFER again, so playback does not bounce
     let holding = false;
     let recentRates = [];
+    // Highest bitrate playback may use on Auto: what the client's measured bitrate bought at playback start, plus
+    // what the connection has proven it carries since. Levels above it stay closed. 0 while there is no ladder.
+    let ceilingBitrate = 0;
+    // When the ceiling last moved, and since when the connection has carried the level above it
+    let ceilingAt = 0;
+    let steadySince = 0;
     let timer = null;
 
     function isFloorFragment(frag) {
         return level !== -1 && frag?.type === 'main' && frag.level === level;
+    }
+
+    // Level indexes from the lowest bitrate up. The master playlist lists the level the client asked for first,
+    // so an index says nothing about bitrate.
+    function byBitrate() {
+        return hls.levels.map((_, index) => index).sort((a, b) => hls.levels[a].bitrate - hls.levels[b].bitrate);
+    }
+
+    // The highest level within the ceiling
+    function ceilingLevel() {
+        const ascending = byBitrate();
+        return ascending.filter(index => hls.levels[index].bitrate <= ceilingBitrate).pop() ?? ascending[0];
     }
 
     function isLoading(load) {
@@ -395,8 +423,7 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
         if (playlistsDue === -1 || performance.now() < playlistsDue) return;
         if ([...playlists.values()].some(entry => !entry.text)) return;
 
-        const byBitrate = hls.levels.map((_, index) => index).sort((a, b) => hls.levels[a].bitrate - hls.levels[b].bitrate);
-        const next = byBitrate.find(index => !playlists.has(index) && !hls.levels[index].details);
+        const next = byBitrate().find(index => !playlists.has(index) && !hls.levels[index].details);
         if (next === undefined) {
             playlistsDue = -1;
             return;
@@ -501,6 +528,37 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
         load?.frag.abortRequests();
     }
 
+    // Opens the ceiling up to what the connection carries, once it has carried it for CLIMB_STEADY: a stream
+    // started on a bad link climbs to the quality it would have got on a good one, without a restart. Levels
+    // playback has already used are below the ceiling and stay open, so a recovery after an outage is not held up.
+    function climb(bufferEnd) {
+        const ascending = byBitrate();
+        const next = ascending.find(index => hls.levels[index].bitrate > ceilingBitrate);
+        const now = performance.now();
+        if (next === undefined
+            || recovering
+            || holding
+            || media.paused
+            || hls.bandwidthEstimate < hls.levels[next].bitrate * CLIMB_HEADROOM
+            || bufferEnd - media.currentTime < RECOVER_BUFFER) {
+            steadySince = 0;
+            return;
+        }
+
+        if (!steadySince) {
+            steadySince = now;
+            return;
+        }
+        if (now - steadySince < CLIMB_STEADY * 1000 || now - ceilingAt < CLIMB_DWELL * 1000) return;
+
+        // Everything the connection carries, not one level per step: it has held up for CLIMB_STEADY by now
+        const reached = ascending.filter(index => hls.levels[index].bitrate * CLIMB_HEADROOM <= hls.bandwidthEstimate).pop();
+        ceilingBitrate = hls.levels[reached].bitrate;
+        ceilingAt = now;
+        steadySince = 0;
+        console.debug(`[hlsFloorLevel] connection carries ${Math.round(hls.bandwidthEstimate / 1000)} kbps, levels up to ${Math.round(ceilingBitrate / 1000)} kbps opened up`);
+    }
+
     function tick() {
         if (level === -1) return;
         loadPlaylists();
@@ -516,6 +574,7 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
                 beforeInit.delete(key);
             }
         }
+        climb(bufferEnd);
         rescue(bufferEnd);
         prefetch(getLoadPosition());
     }
@@ -523,6 +582,16 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
     function findFloorLevel() {
         const levels = hls.levels;
         level = levels.length < 2 ? -1 : levels.reduce((lowest, candidate, index) => (candidate.bitrate < levels[lowest].bitrate ? index : lowest), 0);
+
+        // The ladder reaches above the bitrate the client measured at playback start. Playback begins at that
+        // bitrate, as it always did, and the connection has to prove itself for the levels above it.
+        // The level built for that bitrate carries audio on top of it, so it can sit a little above; the level above
+        // it is at least double, so half again is a safe line between them.
+        if (level !== -1 && !ceilingBitrate) {
+            const start = byBitrate().filter(index => !maxStreamingBitrate || hls.levels[index].bitrate <= maxStreamingBitrate * 1.5).pop();
+            ceilingBitrate = hls.levels[start ?? level].bitrate;
+            ceilingAt = performance.now();
+        }
     }
 
     // Switches to a level picked by hand, or back to Auto (-1), without a rebuffer: what plays in the next
@@ -530,6 +599,13 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
     // about one fragment, too little for a transcode that has to start first.
     function switchLevel(index) {
         hls.loadLevel = index;
+        // A level picked by hand above the ceiling was asked for: Auto keeps it afterwards
+        if (index !== -1 && hls.levels[index].bitrate > ceilingBitrate) {
+            ceilingBitrate = hls.levels[index].bitrate;
+            ceilingAt = performance.now();
+            steadySince = 0;
+        }
+
         const keep = media.currentTime + (index === level ? 1 : SWITCH_MARGIN);
         if (getBufferEnd() <= keep) return;
         for (const load of [mainLoad, floorLoad]) {
@@ -552,6 +628,8 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
         mainLoad = null;
         floorLoad = null;
         initLoad = null;
+        ceilingBitrate = 0;
+        steadySince = 0;
     }
 
     function attach(instance) {
@@ -571,10 +649,14 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
                 recentRates = [];
             }
         });
-        // hls.js forgets a forced level after one fragment, so the hold asks for the lowest level again after each one
+        // hls.js forgets a forced level after one fragment, so the hold, and the ceiling over the levels the
+        // connection has not carried yet, ask for their level again after each one
         hls.on(Hls.Events.FRAG_LOADED, (_event, data) => {
-            if (holding && hls.autoLevelEnabled && data.frag.type === 'main') {
+            if (!hls.autoLevelEnabled || data.frag.type !== 'main') return;
+            if (holding) {
                 hls.nextLoadLevel = level;
+            } else if (ceilingBitrate && hls.levels[hls.nextAutoLevel]?.bitrate > ceilingBitrate) {
+                hls.nextLoadLevel = ceilingLevel();
             }
         });
         hls.on(Hls.Events.DESTROYING, destroy);
