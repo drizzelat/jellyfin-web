@@ -36,6 +36,7 @@ import { MediaError } from 'types/mediaError';
 import { getMediaError } from 'utils/mediaError';
 import { bindSkipSegment } from './skipsegment.ts';
 import * as bitrateTest from 'utils/bitrateTest';
+import { enableHlsJsPlayerForCodecs } from '../htmlMediaHelper';
 
 const UNLIMITED_ITEMS = -1;
 
@@ -1424,6 +1425,15 @@ export class PlaybackManager {
                 if (options.enableAutomaticBitrateDetection) {
                     appSettings.enableAutomaticBitrateDetection(endpointInfo.IsInNetwork, mediaType, true);
                     promise = bitrateTest.detectBitrate(api, true);
+
+                    // An adaptive bitrate stream goes back to Auto at once; the bitrate test only updates the setting
+                    if (player.setAdaptiveBitrateLimit?.(0)) {
+                        promise.then(bitrate => {
+                            appSettings.maxStreamingBitrate(endpointInfo.IsInNetwork, mediaType, bitrate);
+                            playerData.maxStreamingBitrate = bitrate;
+                        });
+                        return;
+                    }
                 } else {
                     appSettings.enableAutomaticBitrateDetection(endpointInfo.IsInNetwork, mediaType, false);
                     promise = Promise.resolve(options.maxBitrate);
@@ -1431,6 +1441,12 @@ export class PlaybackManager {
 
                 promise.then(function (bitrate) {
                     appSettings.maxStreamingBitrate(endpointInfo.IsInNetwork, mediaType, bitrate);
+
+                    // An adaptive bitrate stream with a level close to the choice moves to it without a restart
+                    if (!options.enableAutomaticBitrateDetection && player.setAdaptiveBitrateLimit?.(bitrate)) {
+                        playerData.maxStreamingBitrate = bitrate;
+                        return;
+                    }
 
                     changeStream(player, getCurrentTicks(player), {
                         MaxStreamingBitrate: bitrate
@@ -2907,8 +2923,10 @@ export class PlaybackManager {
                     if (mediaSource.TranscodingSubProtocol === 'hls') {
                         contentType = 'application/x-mpegURL';
 
-                        // With quality on Auto, let the server offer lower bitrate variants to switch between
-                        if (type === 'Video' && appSettings.enableAutomaticBitrateDetection(apiClient.getSavedEndpointInfo()?.IsInNetwork, type)) {
+                        // With quality on Auto, let the server offer lower bitrate variants for hls.js to switch between
+                        if (type === 'Video'
+                            && appSettings.enableAutomaticBitrateDetection(apiClient.getSavedEndpointInfo()?.IsInNetwork, type)
+                            && enableHlsJsPlayerForCodecs(mediaSource, type)) {
                             mediaUrl += '&EnableAdaptiveBitrateStreaming=true';
                         }
                     } else {

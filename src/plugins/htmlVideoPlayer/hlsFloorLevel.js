@@ -12,6 +12,8 @@ const RESCUE_BUFFER = 4;
 // Buffered seconds the lowest level has to build up before playback may climb again after a drop
 const RECOVER_BUFFER = 10;
 const CHECK_INTERVAL = 250;
+// Seconds of buffer a level picked by hand leaves in place, so its transcode has time to start
+const SWITCH_MARGIN = 10;
 // Older browsers play on as before, without the lowest level kept loaded
 const isSupported = typeof AbortController !== 'undefined' && typeof ReadableStream !== 'undefined';
 
@@ -50,6 +52,10 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
     const cache = new Map();
     // Level playlists by level index: { text, url, promise }
     const playlists = new Map();
+    // Timing of the last few fragments downloaded, by URL: { ttfb, transfer }
+    const downloads = new Map();
+    // Media fragments fetched ahead of their level's init segment, by "level:sn": { promise, controller, time }
+    const beforeInit = new Map();
     let hls = null;
     let level = -1;
     // Segments of the lowest level
@@ -62,8 +68,12 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
     // Fragments hls.js is loading itself: one of a higher level, and one of the lowest level missing from the cache
     let mainLoad = null;
     let floorLoad = null;
+    // A higher level's init segment hls.js waits for, with its media fragment fetched first
+    let initLoad = null;
     // Set by a drop to the lowest level or a failed fragment, until downloads show the connection is back
     let recovering = false;
+    // Set by a drop to the lowest level, until it has buffered RECOVER_BUFFER again, so playback does not bounce
+    let holding = false;
     let recentRates = [];
     let timer = null;
 
@@ -175,35 +185,107 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
         callbacks.onSuccess({ url: context.url, data: entry.data.slice(0) }, stats, context, null);
     }
 
+    // Hands over a fragment fetched ahead, timed like the download it was
+    function serveTimed(loader, result, context, callbacks) {
+        downloads.set(context.url, { ttfb: result.ttfb, transfer: result.transfer });
+        const stats = loader.stats;
+        stats.loading.end = performance.now();
+        stats.loading.first = stats.loading.end - result.transfer;
+        stats.loading.start = stats.loading.first - result.ttfb;
+        stats.loaded = stats.total = result.data.byteLength;
+        stats.chunkCount = 1;
+        callbacks.onSuccess({ url: context.url, data: result.data }, stats, context, null);
+    }
+
+    function fetchAhead(key, url) {
+        /* eslint-disable-next-line compat/compat */
+        const controller = new AbortController();
+        const entry = { controller, time: performance.now() };
+        entry.promise = (async () => {
+            try {
+                const response = await fetch(url, { credentials, signal: controller.signal });
+                if (!response.ok) return null;
+                const first = performance.now();
+                const data = await response.arrayBuffer();
+                return { data, ttfb: first - entry.time, transfer: performance.now() - first };
+            } catch {
+                return null;
+            }
+        })();
+        beforeInit.set(key, entry);
+        return entry;
+    }
+
+    // Where hls.js loads next: the end of the buffer, or its start position before playback has begun
+    function getLoadPosition() {
+        if (media.buffered.length || media.currentTime > 0) return getBufferEnd();
+        return Math.max(hls.config.startPosition, 0);
+    }
+
+    // hls.js loads a fragment again when a seek lands during its first load, as at playback start with a resume
+    // position. The browser cache answers the repeat at once, and hls.js would take that for a very fast link.
+    // The repeat gets the timing of the real download instead.
+    function timed(onSuccess) {
+        return (response, stats, context, networkDetails) => {
+            const earlier = downloads.get(context.url);
+            if (earlier) {
+                stats.loading.first = stats.loading.end - earlier.transfer;
+                stats.loading.start = stats.loading.first - earlier.ttfb;
+            } else {
+                downloads.set(context.url, { ttfb: stats.loading.first - stats.loading.start, transfer: stats.loading.end - stats.loading.first });
+                if (downloads.size > 8) downloads.delete(downloads.keys().next().value);
+            }
+            onSuccess(response, stats, context, networkDetails);
+        };
+    }
+
     class FragmentLoader extends DefaultLoader {
         #pending = null;
 
+        #wait(context, callbacks, promise, then) {
+            this.context = context;
+            this.callbacks = callbacks;
+            const request = this.#pending = { cancelled: false };
+            promise.then(result => {
+                if (request.cancelled) return;
+                this.#pending = null;
+                then(result);
+            });
+        }
+
         load(context, config, callbacks) {
             const frag = context.frag;
+            const loadItself = () => super.load(context, config, frag?.type === 'main' ? { ...callbacks, onSuccess: timed(callbacks.onSuccess) } : callbacks);
             if (isFloorFragment(frag)) {
                 const key = frag.sn === 'initSegment' ? 'init' : frag.sn;
                 const entry = cache.get(key);
                 const pending = entry ? Promise.resolve(entry) : (inflight?.key === key && inflight.promise);
                 if (pending) {
-                    this.context = context;
-                    this.callbacks = callbacks;
-                    const request = this.#pending = { cancelled: false };
-                    pending.then(result => {
-                        if (request.cancelled) return;
-                        this.#pending = null;
-                        if (result) {
-                            serve(this, result, context, callbacks);
-                        } else {
-                            super.load(context, config, callbacks);
-                        }
-                    });
+                    this.#wait(context, callbacks, pending, result => (result ? serve(this, result, context, callbacks) : loadItself()));
                     return;
                 }
                 floorLoad = { loader: this, frag };
+            } else if (frag?.type === 'main' && frag.sn === 'initSegment') {
+                // A level's init segment alone starts its transcode at the very beginning of the film. The media
+                // fragment playback needs goes first, so its request starts the transcode there, and the init follows.
+                const next = hls.levels[frag.level]?.details?.fragments.find(candidate => candidate.start + candidate.duration > getLoadPosition() + 0.05);
+                if (next) {
+                    initLoad = { loader: this, frag };
+                    const key = `${frag.level}:${next.sn}`;
+                    this.#wait(context, callbacks, (beforeInit.get(key) ?? fetchAhead(key, next.url)).promise, loadItself);
+                    return;
+                }
             } else if (frag?.type === 'main' && typeof frag.sn === 'number') {
                 mainLoad = { loader: this, frag };
+                const key = `${frag.level}:${frag.sn}`;
+                const entry = beforeInit.get(key);
+                if (entry) {
+                    beforeInit.delete(key);
+                    this.#wait(context, callbacks, entry.promise, result => (result ? serveTimed(this, result, context, callbacks) : loadItself()));
+                    return;
+                }
             }
-            super.load(context, config, callbacks);
+            loadItself();
         }
 
         abort() {
@@ -379,12 +461,18 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
     // Drops to the lowest level, already downloaded, when the buffer is about to run dry and nothing arrives in
     // time: a fragment loading too slowly, or none loading at all while hls.js waits for something else
     function rescue(bufferEnd) {
-        if (!hls.autoLevelEnabled || media.paused || media.seeking || hls.loadLevel === level) return;
+        // Not before playback has its first fragment: hls.js does not recover from an abort of that one
+        if (!hls.autoLevelEnabled || media.paused || media.seeking || !media.buffered.length || hls.loadLevel === level) return;
         const ahead = bufferEnd - media.currentTime;
         if (ahead >= RESCUE_BUFFER) return;
 
-        const load = isLoading(mainLoad) ? mainLoad : null;
-        const sn = load ? load.frag.sn : floor.segments.find(segment => segment.end > bufferEnd + 0.05)?.sn;
+        let load = null;
+        if (isLoading(mainLoad)) {
+            load = mainLoad;
+        } else if (isLoading(initLoad)) {
+            load = initLoad;
+        }
+        const sn = typeof load?.frag.sn === 'number' ? load.frag.sn : floor.segments.find(segment => segment.end > bufferEnd + 0.05)?.sn;
         if (!cache.has(sn) || !cache.has('init')) return;
 
         const now = performance.now();
@@ -398,10 +486,15 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
         }
         if (arrival < ahead - 1) return;
 
-        const reason = load ? 'fragment ' + sn + ' of level ' + load.frag.level + ' is late' : 'nothing is loading';
+        let reason = 'nothing is loading';
+        if (load) {
+            reason = (load === initLoad ? 'the init segment' : 'fragment ' + sn) + ' of level ' + load.frag.level + ' is late';
+        }
         console.debug(`[hlsFloorLevel] ${reason} with ${ahead.toFixed(1)}s buffered, dropping to level ${level}`);
         mainLoad = null;
+        initLoad = null;
         recovering = true;
+        holding = true;
         recentRates = [];
         hls.bandwidthEstimate = hls.levels[level].bitrate;
         hls.nextLoadLevel = level;
@@ -411,10 +504,20 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
     function tick() {
         if (level === -1) return;
         loadPlaylists();
-        if (!floor) return;
+        // A quality picked by hand stays, whatever the connection does
+        if (!floor || !hls.autoLevelEnabled) return;
         const bufferEnd = getBufferEnd();
+        if (holding && bufferEnd - media.currentTime >= RECOVER_BUFFER) {
+            holding = false;
+        }
+        for (const [key, entry] of beforeInit) {
+            if (performance.now() - entry.time > 30000) {
+                entry.controller.abort();
+                beforeInit.delete(key);
+            }
+        }
         rescue(bufferEnd);
-        prefetch(bufferEnd);
+        prefetch(getLoadPosition());
     }
 
     function findFloorLevel() {
@@ -422,25 +525,42 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
         level = levels.length < 2 ? -1 : levels.reduce((lowest, candidate, index) => (candidate.bitrate < levels[lowest].bitrate ? index : lowest), 0);
     }
 
+    // Switches to a level picked by hand, or back to Auto (-1), without a rebuffer: what plays in the next
+    // SWITCH_MARGIN seconds stays, and the buffer after it is replaced by the new level. hls.js would keep only
+    // about one fragment, too little for a transcode that has to start first.
+    function switchLevel(index) {
+        hls.loadLevel = index;
+        const keep = media.currentTime + (index === level ? 1 : SWITCH_MARGIN);
+        if (getBufferEnd() <= keep) return;
+        for (const load of [mainLoad, floorLoad]) {
+            if (isLoading(load)) load.frag.abortRequests();
+        }
+        hls.trigger(Hls.Events.BUFFER_FLUSHING, { startOffset: keep, endOffset: Number.POSITIVE_INFINITY, type: null });
+    }
+
     function destroy() {
         clearInterval(timer);
         inflight?.controller.abort();
         cache.clear();
         playlists.clear();
+        downloads.clear();
+        for (const entry of beforeInit.values()) entry.controller.abort();
+        beforeInit.clear();
         hls = null;
         level = -1;
         floor = null;
         mainLoad = null;
         floorLoad = null;
+        initLoad = null;
     }
 
     function attach(instance) {
-        if (!isSupported) return;
         hls = instance;
+        if (!isSupported) return;
         hls.on(Hls.Events.MANIFEST_PARSED, findFloorLevel);
         hls.on(Hls.Events.LEVELS_UPDATED, findFloorLevel);
-        // Only once playback got its first fragment, so the playlists do not slow down the start
-        hls.on(Hls.Events.FRAG_BUFFERED, (_event, data) => {
+        // From the first fragment on, so the lowest level is there if the start turns out too slow
+        hls.on(Hls.Events.FRAG_LOADING, (_event, data) => {
             if (level !== -1 && playlists.size === 0 && playlistsDue === -1 && data.frag.type === 'main') {
                 playlistsDue = 0;
             }
@@ -451,9 +571,15 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
                 recentRates = [];
             }
         });
+        // hls.js forgets a forced level after one fragment, so the hold asks for the lowest level again after each one
+        hls.on(Hls.Events.FRAG_LOADED, (_event, data) => {
+            if (holding && hls.autoLevelEnabled && data.frag.type === 'main') {
+                hls.nextLoadLevel = level;
+            }
+        });
         hls.on(Hls.Events.DESTROYING, destroy);
         timer = setInterval(tick, CHECK_INTERVAL);
     }
 
-    return { FragmentLoader, PlaylistLoader, attach };
+    return { FragmentLoader, PlaylistLoader, attach, switchLevel };
 }
