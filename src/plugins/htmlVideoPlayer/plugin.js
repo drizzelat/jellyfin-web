@@ -306,6 +306,7 @@ export class HtmlVideoPlayer {
      * @type {any | undefined}
      */
     _hlsPlayer;
+    _hlsFloorLevel;
     /**
      * @private (used in other files)
      * @type {any | null | undefined}
@@ -448,7 +449,8 @@ export class HtmlVideoPlayer {
                 const getMaxBufferLength = (bitrate) => {
                     return (browser.chrome || browser.edgeChromium || browser.firefox) && bitrate >= 25000000 ? 6 : 30;
                 };
-                const maxBufferLength = getMaxBufferLength(playbackManager.getMaxStreamingBitrate(this));
+                const maxStreamingBitrate = playbackManager.getMaxStreamingBitrate(this);
+                const maxBufferLength = getMaxBufferLength(maxStreamingBitrate);
 
                 const includeCorsCredentials = await getIncludeCorsCredentials();
                 const floorLevel = createHlsFloorLevel(elem, includeCorsCredentials);
@@ -460,6 +462,10 @@ export class HtmlVideoPlayer {
                     maxMaxBufferLength: maxBufferLength,
                     capLevelToPlayerSize: true,
                     videoPreference: { preferHDR: true },
+                    // jellyfin-web measured the connection already (Auto is 70 % of it). The hls.js test loads its first
+                    // fragment twice, and the second load comes from the browser cache and reads as a very fast link.
+                    testBandwidth: false,
+                    ...(maxStreamingBitrate && { abrEwmaDefaultEstimate: maxStreamingBitrate / 0.7 }),
                     fLoader: floorLevel.FragmentLoader,
                     pLoader: floorLevel.PlaylistLoader,
                     xhrSetup(xhr) {
@@ -475,6 +481,7 @@ export class HtmlVideoPlayer {
                 });
 
                 floorLevel.attach(hls);
+                this._hlsFloorLevel = floorLevel;
 
                 hls.loadSource(url);
                 hls.attachMedia(elem);
@@ -2136,6 +2143,32 @@ export class HtmlVideoPlayer {
         }
 
         return hls.levels[hls.currentLevel]?.bitrate || null;
+    }
+
+    /**
+     * Applies a quality choice within an adaptive bitrate stream, without restarting it: the highest level at or
+     * below the chosen bitrate, or the lowest level.
+     * @param {number} maxBitrate - The chosen bitrate, or 0 for Auto.
+     * @returns {boolean} false when the choice is above what the stream carries, so it takes a new transcode.
+     */
+    setAdaptiveBitrateLimit(maxBitrate) {
+        const hls = this._hlsPlayer;
+        if (!hls || hls.levels.length < 2) {
+            return false;
+        }
+
+        if (!maxBitrate) {
+            this._hlsFloorLevel.switchLevel(-1);
+            return true;
+        }
+
+        const byBitrate = hls.levels.map((level, index) => index).sort((a, b) => hls.levels[a].bitrate - hls.levels[b].bitrate);
+        if (maxBitrate > hls.levels[byBitrate[byBitrate.length - 1]].bitrate * 1.1) {
+            return false;
+        }
+
+        this._hlsFloorLevel.switchLevel(byBitrate.filter(index => hls.levels[index].bitrate <= maxBitrate).pop() ?? byBitrate[0]);
+        return true;
     }
 
     getBufferedRanges() {
