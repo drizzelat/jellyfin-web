@@ -55,7 +55,7 @@ function parsePlaylist(text, baseUrl) {
 /**
  * Creates the loaders to pass to the hls.js config, then attach() the hls.js instance.
  */
-export function createHlsFloorLevel(media, includeCorsCredentials, maxStreamingBitrate) {
+export function createHlsFloorLevel(media, includeCorsCredentials) {
     const DefaultLoader = Hls.DefaultConfig.loader;
     const credentials = includeCorsCredentials ? 'include' : 'same-origin';
     // Downloaded fragments of the lowest level by sequence number, and its init segment as 'init'
@@ -584,13 +584,20 @@ export function createHlsFloorLevel(media, includeCorsCredentials, maxStreamingB
         level = levels.length < 2 ? -1 : levels.reduce((lowest, candidate, index) => (candidate.bitrate < levels[lowest].bitrate ? index : lowest), 0);
 
         // The ladder reaches above the bitrate the client measured at playback start. Playback begins at that
-        // bitrate, as it always did, and the connection has to prove itself for the levels above it.
-        // The level built for that bitrate carries audio on top of it, so it can sit a little above; the level above
-        // it is at least double, so half again is a safe line between them.
+        // bitrate, as it always did, and the connection has to prove itself for the levels above it. The master
+        // playlist lists the level built for that bitrate first, so that level is the line. A bitrate of its own
+        // would not do: the levels above it double it, but the top one is what the source carries, and that can
+        // land just above the requested bitrate rather than a level away from it.
         if (level !== -1 && !ceilingBitrate) {
-            const start = byBitrate().filter(index => !maxStreamingBitrate || hls.levels[index].bitrate <= maxStreamingBitrate * 1.5).pop();
-            ceilingBitrate = hls.levels[start ?? level].bitrate;
+            ceilingBitrate = hls.levels[0].bitrate;
             ceilingAt = performance.now();
+
+            // hls.js has picked the level to start on by now, off an estimate with no measurement behind it yet.
+            // It asks for that level's playlist first, so bringing it back under the ceiling here still comes
+            // before the fragment, and before the transcode the fragment would start on the server.
+            if (hls.autoLevelEnabled && hls.levels[hls.nextAutoLevel]?.bitrate > ceilingBitrate) {
+                hls.nextLoadLevel = ceilingLevel();
+            }
         }
     }
 

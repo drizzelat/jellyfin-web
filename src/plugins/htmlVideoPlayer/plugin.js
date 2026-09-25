@@ -453,7 +453,7 @@ export class HtmlVideoPlayer {
                 const maxBufferLength = getMaxBufferLength(maxStreamingBitrate);
 
                 const includeCorsCredentials = await getIncludeCorsCredentials();
-                const floorLevel = createHlsFloorLevel(elem, includeCorsCredentials, maxStreamingBitrate);
+                const floorLevel = createHlsFloorLevel(elem, includeCorsCredentials);
 
                 const hls = new Hls({
                     startPosition: options.playerStartPositionTicks / 10000000,
@@ -462,10 +462,12 @@ export class HtmlVideoPlayer {
                     maxMaxBufferLength: maxBufferLength,
                     capLevelToPlayerSize: true,
                     videoPreference: { preferHDR: true },
-                    // jellyfin-web measured the connection already (Auto is 70 % of it). The hls.js test loads its first
-                    // fragment twice, and the second load comes from the browser cache and reads as a very fast link.
+                    // jellyfin-web measured the connection already. The hls.js test loads its first fragment twice,
+                    // and the second load comes from the browser cache and reads as a very fast link.
                     testBandwidth: false,
-                    ...(maxStreamingBitrate && { abrEwmaDefaultEstimate: maxStreamingBitrate / 0.7 }),
+                    // Enough for the level built for the measured bitrate to be the one picked to start on, and not
+                    // enough for the level above it: the ladder's next level up is a third higher at the very least.
+                    ...(maxStreamingBitrate && { abrEwmaDefaultEstimate: maxStreamingBitrate * 1.05 }),
                     fLoader: floorLevel.FragmentLoader,
                     pLoader: floorLevel.PlaylistLoader,
                     xhrSetup(xhr) {
