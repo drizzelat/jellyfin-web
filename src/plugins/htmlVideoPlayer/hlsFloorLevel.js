@@ -1,6 +1,6 @@
 /**
- * Keeps the lowest adaptive bitrate level of an hls.js stream loaded past the end of the buffer, and every level's
- * playlist loaded in advance. When the connection breaks down, playback drops to the lowest level at once instead of
+ * Keeps the lowest adaptive bitrate level of an hls.js stream loaded past the end of the buffer, up to a few minutes
+ * of it while the buffer is healthy, and every level's playlist loaded in advance. When the connection breaks down, playback drops to the lowest level at once instead of
  * waiting for its playlist, a new transcode and a download. The server runs that level as a transcode of its own,
  * next to the level playing.
  *
@@ -11,6 +11,11 @@
 
 // Seconds of the lowest level kept loaded past the end of the buffer
 const FLOOR_AHEAD = 30;
+// Seconds of the lowest level loaded past the end of the buffer while the buffer is healthy, to play through an
+// outage of a few minutes. It only loads while the level playing does not need the connection.
+const FLOOR_RESERVE = 300;
+// Buffered seconds the level playing needs before the lowest level loads beyond FLOOR_AHEAD
+const HEALTHY_BUFFER = 15;
 // Below this many buffered seconds, a fragment that will not arrive in time is given up for the lowest level
 const RESCUE_BUFFER = 4;
 // Buffered seconds the lowest level has to build up before playback may climb again after a drop
@@ -448,12 +453,13 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
         return end;
     }
 
-    function prefetch(bufferEnd) {
+    function prefetch(bufferEnd, healthy) {
         const { segments } = floor;
+        const ahead = healthy ? FLOOR_RESERVE : FLOOR_AHEAD;
         const first = segments[0]?.sn ?? 0;
         for (const key of cache.keys()) {
             const segment = segments[key - first];
-            if (key !== 'init' && (!segment || segment.end < media.currentTime || segment.start > bufferEnd + FLOOR_AHEAD * 2)) {
+            if (key !== 'init' && (!segment || segment.end < media.currentTime || segment.start > bufferEnd + FLOOR_RESERVE * 2)) {
                 cache.delete(key);
             }
         }
@@ -461,7 +467,7 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
         const hlsLoading = isLoading(floorLoad) ? floorLoad.frag.sn : null;
         let wanted = null;
         let index = segments.findIndex(segment => segment.end > bufferEnd);
-        for (; index !== -1 && index < segments.length && segments[index].start < bufferEnd + FLOOR_AHEAD; index++) {
+        for (; index !== -1 && index < segments.length && segments[index].start < bufferEnd + ahead; index++) {
             if (!cache.has(segments[index].sn) && segments[index].sn !== hlsLoading) {
                 wanted = segments[index];
                 break;
@@ -469,9 +475,9 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
         }
 
         if (inflight) {
-            // A seek moved the window away from the download
+            // A seek moved the window away from the download, or the level playing needs the connection back
             const segment = inflight.key === 'init' ? null : segments[inflight.key - first];
-            if (segment && (segment.end < media.currentTime || segment.start > bufferEnd + FLOOR_AHEAD)) {
+            if (segment && (segment.end < media.currentTime || segment.start > bufferEnd + ahead)) {
                 inflight.controller.abort();
             }
             return;
@@ -576,7 +582,9 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
         }
         climb(bufferEnd);
         rescue(bufferEnd);
-        prefetch(getLoadPosition());
+        // Playing the lowest level from the cache fills the buffer at once, so the reserve keeps loading after a
+        // drop to it, and those downloads are what shows the connection is back
+        prefetch(getLoadPosition(), media.buffered.length > 0 && bufferEnd - media.currentTime >= HEALTHY_BUFFER);
     }
 
     function findFloorLevel() {
