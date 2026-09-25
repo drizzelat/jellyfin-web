@@ -32,7 +32,7 @@ import { MediaError } from 'types/mediaError';
 import { getMediaError } from 'utils/mediaError';
 import { toApi } from 'utils/jellyfin-apiclient/compat';
 import { bindSkipSegment } from './skipsegment.ts';
-import { enableHlsJsPlayerForCodecs } from '../htmlMediaHelper';
+import { enableHlsJsPlayer, enableHlsJsPlayerForCodecs } from '../htmlMediaHelper';
 
 const UNLIMITED_ITEMS = -1;
 
@@ -489,6 +489,17 @@ async function getPlaybackInfo(player, apiClient, item, deviceProfile, mediaSour
         && player.supportsPlayMethod && !player.supportsPlayMethod('DirectStream', item)
     ) {
         query.EnableDirectStream = false;
+    }
+
+    // A remote stream on Auto starts as a transcode, so it gets the adaptive bitrate ladder: a direct play or a
+    // remux has no lower levels, and one started on a good link stayed at the source bitrate after the link got worse
+    if (item.MediaType === 'Video'
+        && apiClient.getSavedEndpointInfo()?.IsInNetwork === false
+        && appSettings.enableAutomaticBitrateDetection(false, 'Video')
+        && enableHlsJsPlayer(item.RunTimeTicks, 'Video')) {
+        query.EnableDirectPlay = false;
+        query.EnableDirectStream = false;
+        query.AllowVideoStreamCopy = false;
     }
 
     if (player.getDirectPlayProtocols) {
