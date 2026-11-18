@@ -595,9 +595,11 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
         // bitrate, as it always did, and the connection has to prove itself for the levels above it. The master
         // playlist lists the level built for that bitrate first, so that level is the line. A bitrate of its own
         // would not do: the levels above it double it, but the top one is what the source carries, and that can
-        // land just above the requested bitrate rather than a level away from it.
+        // land just above the requested bitrate rather than a level away from it. hls.js sorts the levels by
+        // height, then bitrate, and firstLevel is where the manifest's first one ended up; since each level
+        // carries its own RESOLUTION (Jellyfin 12), levels[0] is the lowest, not the first.
         if (level !== -1 && !ceilingBitrate) {
-            ceilingBitrate = hls.levels[0].bitrate;
+            ceilingBitrate = (hls.levels[hls.firstLevel] ?? hls.levels[0]).bitrate;
             ceilingAt = performance.now();
 
             // hls.js has picked the level to start on by now, off an estimate with no measurement behind it yet.
