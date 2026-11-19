@@ -684,6 +684,13 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
             } else if (ceilingBitrate && hls.levels[hls.nextAutoLevel]?.bitrate > ceilingBitrate) {
                 hls.nextLoadLevel = ceilingLevel();
             }
+            // A higher level is a transcode that has yet to start, 5-10 s for a 4K source, and the server may be
+            // the bottleneck rather than the link: the buffer has to carry that, so a switch up waits for a healthy one
+            const loaded = hls.levels[data.frag.level];
+            const next = hls.levels[hls.nextLoadLevel === -1 ? hls.nextAutoLevel : hls.nextLoadLevel];
+            if (loaded && next && next.bitrate > loaded.bitrate && getBufferEnd() - media.currentTime < HEALTHY_BUFFER) {
+                hls.nextLoadLevel = data.frag.level;
+            }
         });
         hls.on(Hls.Events.DESTROYING, destroy);
         timer = setInterval(tick, CHECK_INTERVAL);
