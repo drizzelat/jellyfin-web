@@ -29,6 +29,10 @@ const CLIMB_STEADY = 30;
 const CLIMB_DWELL = 60;
 // Headroom over such a level's bitrate the connection has to show for all of CLIMB_STEADY
 const CLIMB_HEADROOM = 1.4;
+// Milliseconds of a fragment's wait for its first byte that hls.js is shown. Jellyfin answers a fragment only once
+// ffmpeg has written it, so a longer wait is the server transcoding, and the bytes then arrive at link speed. Counted
+// as download time, that wait pinned the estimate at the speed a 4K source transcodes (1-3 Mbps) on any link.
+const LINK_TTFB = 300;
 // Older browsers play on as before, without the lowest level kept loaded
 const isSupported = typeof AbortController !== 'undefined' && typeof ReadableStream !== 'undefined';
 
@@ -97,6 +101,10 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
     let ceilingAt = 0;
     let steadySince = 0;
     let timer = null;
+
+    function linkTtfb(ms) {
+        return Math.min(ms, LINK_TTFB);
+    }
 
     function isFloorFragment(frag) {
         return level !== -1 && frag?.type === 'main' && frag.level === level;
@@ -209,7 +217,7 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
         const rate = currentRate();
         const longest = (context.frag.duration || 3) * 1000;
         const transfer = rate > 0 ? Math.min(entry.data.byteLength / rate, longest) : longest;
-        stats.loading.start = now - transfer - entry.ttfb;
+        stats.loading.start = now - transfer - linkTtfb(entry.ttfb);
         stats.loading.first = now - transfer;
         stats.loading.end = now;
         stats.loaded = stats.total = entry.data.byteLength;
@@ -224,7 +232,7 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
         const stats = loader.stats;
         stats.loading.end = performance.now();
         stats.loading.first = stats.loading.end - result.transfer;
-        stats.loading.start = stats.loading.first - result.ttfb;
+        stats.loading.start = stats.loading.first - linkTtfb(result.ttfb);
         stats.loaded = stats.total = result.data.byteLength;
         stats.chunkCount = 1;
         callbacks.onSuccess({ url: context.url, data: result.data }, stats, context, null);
@@ -257,16 +265,17 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
 
     // hls.js loads a fragment again when a seek lands during its first load, as at playback start with a resume
     // position. The browser cache answers the repeat at once, and hls.js would take that for a very fast link.
-    // The repeat gets the timing of the real download instead.
+    // The repeat gets the timing of the real download instead. Either way only LINK_TTFB of the wait counts.
     function timed(onSuccess) {
         return (response, stats, context, networkDetails) => {
             const earlier = downloads.get(context.url);
             if (earlier) {
                 stats.loading.first = stats.loading.end - earlier.transfer;
-                stats.loading.start = stats.loading.first - earlier.ttfb;
+                stats.loading.start = stats.loading.first - linkTtfb(earlier.ttfb);
             } else {
                 downloads.set(context.url, { ttfb: stats.loading.first - stats.loading.start, transfer: stats.loading.end - stats.loading.first });
                 if (downloads.size > 8) downloads.delete(downloads.keys().next().value);
+                stats.loading.start = stats.loading.first - linkTtfb(stats.loading.first - stats.loading.start);
             }
             onSuccess(response, stats, context, networkDetails);
         };
