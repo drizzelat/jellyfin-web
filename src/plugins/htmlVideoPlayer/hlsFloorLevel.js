@@ -110,15 +110,24 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
         return level !== -1 && frag?.type === 'main' && frag.level === level;
     }
 
-    // Level indexes from the lowest bitrate up. The master playlist lists the level the client asked for first,
-    // so an index says nothing about bitrate.
-    function byBitrate() {
-        return hls.levels.map((_, index) => index).sort((a, b) => hls.levels[a].bitrate - hls.levels[b].bitrate);
+    // The adaptive bitrate ladder: indexes of the levels playback switches between, from the lowest bitrate up, or
+    // none. The master playlist lists the level the client asked for first, so an index says nothing about bitrate.
+    // hls.js switches only between levels of one codec set and video range. Jellyfin lists a stream-copied HDR
+    // source again as an SDR transcode at the same bitrate, for clients that cannot play HDR: that level is no rung,
+    // and loading it next to the one playing makes the server replace one transcode with the other, back and forth.
+    function ladderLevels() {
+        const levels = hls?.levels ?? [];
+        const first = levels[hls?.firstLevel] ?? levels[0];
+        if (!first) return [];
+        const ladder = levels.map((_, index) => index)
+            .filter(index => levels[index].codecSet === first.codecSet && levels[index].videoRange === first.videoRange)
+            .sort((a, b) => levels[a].bitrate - levels[b].bitrate);
+        return levels[ladder[0]].bitrate < levels[ladder[ladder.length - 1]].bitrate ? ladder : [];
     }
 
     // The highest level within the ceiling
     function ceilingLevel() {
-        const ascending = byBitrate();
+        const ascending = ladderLevels();
         return ascending.filter(index => hls.levels[index].bitrate <= ceilingBitrate).pop() ?? ascending[0];
     }
 
@@ -189,7 +198,7 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
     // hls.js never returns to a level whose fragments failed, and an outage fails them all
     function recover(bitsPerSecond) {
         const floorBitrate = hls.levels[level].bitrate;
-        const nextBitrate = Math.min(...hls.levels.map(candidate => candidate.bitrate).filter(bitrate => bitrate > floorBitrate));
+        const nextBitrate = Math.min(...ladderLevels().map(index => hls.levels[index].bitrate).filter(bitrate => bitrate > floorBitrate));
         recentRates = [...recentRates.slice(-1), bitsPerSecond];
         if (recentRates.length < 2 || Math.min(...recentRates) <= 2 * nextBitrate) return;
         if (getBufferEnd() - media.currentTime < RECOVER_BUFFER) return;
@@ -437,7 +446,7 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
         if (playlistsDue === -1 || performance.now() < playlistsDue) return;
         if ([...playlists.values()].some(entry => !entry.text)) return;
 
-        const next = byBitrate().find(index => !playlists.has(index) && !hls.levels[index].details);
+        const next = ladderLevels().find(index => !playlists.has(index) && !hls.levels[index].details);
         if (next === undefined) {
             playlistsDue = -1;
             return;
@@ -547,7 +556,7 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
     // started on a bad link climbs to the quality it would have got on a good one, without a restart. Levels
     // playback has already used are below the ceiling and stay open, so a recovery after an outage is not held up.
     function climb(bufferEnd) {
-        const ascending = byBitrate();
+        const ascending = ladderLevels();
         const next = ascending.find(index => hls.levels[index].bitrate > ceilingBitrate);
         const now = performance.now();
         if (next === undefined
@@ -597,8 +606,7 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
     }
 
     function findFloorLevel() {
-        const levels = hls.levels;
-        level = levels.length < 2 ? -1 : levels.reduce((lowest, candidate, index) => (candidate.bitrate < levels[lowest].bitrate ? index : lowest), 0);
+        level = ladderLevels()[0] ?? -1;
 
         // The ladder reaches above the bitrate the client measured at playback start. Playback begins at that
         // bitrate, as it always did, and the connection has to prove itself for the levels above it. The master
@@ -678,7 +686,7 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
         // hls.js forgets a forced level after one fragment, so the hold, and the ceiling over the levels the
         // connection has not carried yet, ask for their level again after each one
         hls.on(Hls.Events.FRAG_LOADED, (_event, data) => {
-            if (!hls.autoLevelEnabled || data.frag.type !== 'main') return;
+            if (level === -1 || !hls.autoLevelEnabled || data.frag.type !== 'main') return;
             if (holding) {
                 hls.nextLoadLevel = level;
             } else if (ceilingBitrate && hls.levels[hls.nextAutoLevel]?.bitrate > ceilingBitrate) {
@@ -696,5 +704,5 @@ export function createHlsFloorLevel(media, includeCorsCredentials) {
         timer = setInterval(tick, CHECK_INTERVAL);
     }
 
-    return { FragmentLoader, PlaylistLoader, attach, switchLevel };
+    return { FragmentLoader, PlaylistLoader, attach, switchLevel, ladderLevels };
 }

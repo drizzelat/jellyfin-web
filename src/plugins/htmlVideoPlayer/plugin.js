@@ -2330,7 +2330,7 @@ export class HtmlVideoPlayer {
      */
     getPlayingAdaptiveBitrate() {
         const hls = this._hlsPlayer;
-        if (!hls || hls.levels.length < 2) {
+        if (!hls || !this._hlsFloorLevel?.ladderLevels().length) {
             return null;
         }
 
@@ -2345,7 +2345,8 @@ export class HtmlVideoPlayer {
      */
     setAdaptiveBitrateLimit(maxBitrate) {
         const hls = this._hlsPlayer;
-        if (!hls || hls.levels.length < 2) {
+        const ladder = hls ? this._hlsFloorLevel?.ladderLevels() ?? [] : [];
+        if (!ladder.length) {
             return false;
         }
 
@@ -2354,12 +2355,11 @@ export class HtmlVideoPlayer {
             return true;
         }
 
-        const byBitrate = hls.levels.map((level, index) => index).sort((a, b) => hls.levels[a].bitrate - hls.levels[b].bitrate);
-        if (maxBitrate > hls.levels[byBitrate[byBitrate.length - 1]].bitrate * 1.1) {
+        if (maxBitrate > hls.levels[ladder[ladder.length - 1]].bitrate * 1.1) {
             return false;
         }
 
-        this._hlsFloorLevel.switchLevel(byBitrate.filter(index => hls.levels[index].bitrate <= maxBitrate).pop() ?? byBitrate[0]);
+        this._hlsFloorLevel.switchLevel(ladder.filter(index => hls.levels[index].bitrate <= maxBitrate).pop() ?? ladder[0]);
         return true;
     }
 
